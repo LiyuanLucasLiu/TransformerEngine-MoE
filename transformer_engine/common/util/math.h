@@ -35,33 +35,38 @@ __device__ inline OType sigmoid(const IType val, const Empty&) {
 template <typename OType, typename IType>
 __device__ inline OType dsigmoid(const IType val, const Empty& e) {
     const float cval = val;
-    const float s = sigmoid<float, float>(cval, e);
+    const float s = 1.f / (1.f + expf(-cval));
     return s * (1.f - s);
 }
 
 template <typename OType, typename IType>
 __device__ inline OType qgelu(const IType val, const Empty& e) {
     const float cval = val;
-    return cval * sigmoid<float, float>(1.702f * cval, e);
+    return cval * 1.f / (1.f + expf(-1.702f * cval));
 }
 
 template <typename OType, typename IType>
 __device__ inline OType dqgelu(const IType val, const Empty& e) {
     const float cval = val;
-    return cval * dsigmoid<float, float>(1.702f * cval, e) +
-                   sigmoid<float, float>(1.702f * cval, e);
+    // return cval * dsigmoid<float, float>(1.702f * cval, e) +
+    //                sigmoid<float, float>(1.702f * cval, e);
+    const float s = 1.f / (1.f + expf(-1.702f * cval));
+    return cval * s * (1.f - s) + s;
 }
 
 template <typename OType, typename IType>
 __device__ inline OType swish(const IType val, const Empty& e) {
     const float cval = val;
-    return cval * sigmoid<float, float>(cval, e);
+    // return cval * sigmoid<float, float>(cval, e);
+    return cval * 1.f / (1.f + expf(-cval));
 }
 
 template <typename OType, typename IType>
 __device__ inline OType dswish(const IType val, const Empty& e) {
     const float cval = val;
-    return cval * dsigmoid<float, float>(cval, e) + sigmoid<float, float>(cval, e);
+    // return cval * dsigmoid<float, float>(cval, e) + sigmoid<float, float>(cval, e);
+    const float s = 1.f / (1.f + expf(-cval));
+    return cval * s * (1.f - s) + s;
 }
 
 template <typename OType, typename IType>

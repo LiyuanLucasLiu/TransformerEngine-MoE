@@ -334,7 +334,6 @@ class TorchGLU(nn.Module):
         a = self.act(a)
         return a * b
 
-
 class TorchLayerNormMLP(nn.Module):
     def __init__(self, hidden_size: int, ffn_hidden_size: int,
                  eps: float = 1e-5, activation = 'gelu',
@@ -360,7 +359,6 @@ class TorchLayerNormMLP(nn.Module):
 
     def forward(self, x):
         return self.fc2(self.gelu(self.fc1(self.ln(x))))
-
 
 class TorchGPT(nn.Module):
     def __init__(self, hidden_size: int, eps: float, num_attention_heads: int, parallel_attention_mlp: bool):

@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""LayerNormMLP API"""
+"""MLP API"""
 import os
 import warnings
 from typing import Union, Optional, Callable, Tuple, List, Dict, Any
@@ -43,7 +43,6 @@ from ..distributed import (
     gather_along_first_dim,
     is_fp8_activation_recompute_enabled,
     in_fp8_activation_recompute_phase,
-    use_reentrant_activation_recompute,
 )
 
 from .. import cpp_extensions as tex
@@ -52,9 +51,9 @@ from ..constants import dist_group_type, TE_DType
 from ..jit import no_torch_dynamo
 
 from ..float8_tensor import Float8Tensor
-from ._common import _apply_normalization
+# from ._common import _apply_normalization
 
-__all__ = ["LayerNormMLP"]
+__all__ = ["MLP"]
 
 
 def _act_func(activation: str):
@@ -64,15 +63,13 @@ def _act_func(activation: str):
             'geglu': (tex.geglu, tex.dgeglu),
             'reglu': (tex.reglu, tex.dreglu),
             'swiglu': (tex.swiglu, tex.dswiglu),
-            'qgelu': (tex.qgelu, tex.dqgelu)
     }
     if activation not in funcs:
         raise NotImplementedError("Activation type " + activation + " is not supported!")
     return funcs[activation]
 
-
-class _LayerNormMLP(torch.autograd.Function):
-    """LayerNormMLP semi-top level module
+class _EmptyMLP(torch.autograd.Function):
+    """MLP semi-top level module
     Calls custom cuda extensions.
     """
 
@@ -80,8 +77,55 @@ class _LayerNormMLP(torch.autograd.Function):
     def forward(
         ctx,
         inp: torch.Tensor,
-        ln_weight: torch.Tensor,
-        ln_bias: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc1_bias: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        fc2_bias: torch.Tensor,
+        fp8: bool,
+        fp8_meta: Dict[str, Any],
+        tp_group: Union[dist_group_type, None],
+        tp_size: int,
+        is_grad_enabled: bool,
+    ):
+        if is_grad_enabled:
+            ctx.fp8 = fp8
+            ctx.fp8_meta = fp8_meta
+            ctx.tp_group = tp_group
+            ctx.tp_size = tp_size
+        return inp
+            
+
+    @staticmethod
+    def backward(
+        ctx, grad_outputs: Tuple[torch.Tensor, ...]
+    ) -> Tuple[Union[torch.Tensor, None], ...]:
+        with _prepare_backward(
+            ctx.fp8, ctx.fp8_meta, ctx.tp_group, ctx.tp_size, name="_MLP"
+        ):
+            pass
+
+        return (
+            grad_outputs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+class _MLP(torch.autograd.Function):
+    """MLP semi-top level module
+    Calls custom cuda extensions.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        inp: torch.Tensor,
         fc1_weight: torch.Tensor,
         fc1_weight_fp8: Union[torch.Tensor, None],
         fc1_weight_t_fp8: Union[torch.Tensor, None],
@@ -92,7 +136,6 @@ class _LayerNormMLP(torch.autograd.Function):
         fc2_weight_t_fp8: Union[torch.Tensor, None],
         fc2_bias: torch.Tensor,
         use_fc2_bias: bool,
-        eps: float,
         is_first_microbatch: Union[bool, None],
         fp8: bool,
         fp8_calibration: bool,
@@ -104,25 +147,21 @@ class _LayerNormMLP(torch.autograd.Function):
         sequence_parallel: bool,
         tensor_parallel: bool,
         activation_dtype: torch.dtype,
-        return_layernorm_output: bool,
-        return_layernorm_output_gathered: bool,
         bias_gelu_nvfusion: bool,
         set_parallel_mode: bool,
         is_grad_enabled: bool,
-        fwd_ln_sm_margin: int,
-        bwd_ln_sm_margin: int,
         zero_centered_gamma: bool,
         activation: str,
-        normalization: str,
         primary_weights_in_fp8: bool,
         ub_bulk_wgrad: bool,
         ub_bulk_dgrad: bool,
-        ub_overlap_rs: bool,
-        ub_overlap_ag: bool,
-        gemm_gelu_fusion: bool,
+        ub_split_rs: bool,
+        ub_atomic_gemm_rs: bool,
+        ub_split_ag: bool,
+        ub_atomic_gemm_ag: bool,
     ) -> Union[Tuple[torch.Tensor, ...], torch.Tensor]:
         # Make sure input dimensions are compatible
-        in_features = ln_weight.numel()
+        in_features = fc1_weight.shape[-1]
         assert inp.shape[-1] == in_features, "GEMM not possible"
         inputmat = inp.view((-1, in_features))
         if fp8:
@@ -134,80 +173,46 @@ class _LayerNormMLP(torch.autograd.Function):
 
         activation_func = _act_func(activation)[0]
 
-        # Cast for native AMP
-        inputmat = cast_if_needed(inputmat, activation_dtype)
-        ln_weight = cast_if_needed(ln_weight, activation_dtype)
-        if ln_bias is not None:
-            ln_bias = cast_if_needed(ln_bias, activation_dtype)
-
-        tp_world_size = get_distributed_world_size(tp_group)
-        if ub_overlap_ag:
-            if tp_world_size == 1 or (not is_grad_enabled) or return_layernorm_output:
-                ub_overlap_ag = False
+        if ub_split_ag or ub_atomic_gemm_ag:
+            tp_world_size = get_distributed_world_size(tp_group)
+            if tp_world_size == 1 or (not is_grad_enabled): # or return_layernorm_output:
+                ub_split_ag = False
+                ub_atomic_gemm_ag = False
+        ub_overlap_ag = ub_split_ag or ub_atomic_gemm_ag
+        assert not ub_overlap_ag, 'not tested'
+        
         if ub_overlap_ag:
             ub_obj_lnout = get_ub("fc1_fprop")
-            ln_out = ub_obj_lnout.get_ubuf_output(0)
-        else:
-            ln_out_dtype = torch.uint8 if (fp8 and not return_layernorm_output) else inputmat.dtype
-            ln_out = torch.empty_like(inputmat, dtype=ln_out_dtype)
-        ub_overlap_rs = False if tp_world_size == 1 else ub_overlap_rs
+        
+        if ub_split_rs or ub_atomic_gemm_rs:
+            tp_world_size = get_distributed_world_size(tp_group)
+            if tp_world_size == 1:
+                ub_split_rs = False
+                ub_atomic_gemm_rs = False
+        if ub_atomic_gemm_rs or ub_atomic_gemm_ag:
+            assert fp8, "AtomicGemm overlap supported only for FP8 GEMM."
 
         fp8_dtype_forward = get_fp8_te_dtype(fp8_meta["recipe"], fprop_tensor=True)
-
-        ln_out, mu, rsigma = _apply_normalization(inputmat,
-                                                  ln_out,
-                                                  ln_weight,
-                                                  ln_bias,
-                                                  eps,
-                                                  fp8 and not return_layernorm_output,
-                                                  fp8_meta,
-                                                  normalization,
-                                                  fwd_ln_sm_margin,
-                                                  zero_centered_gamma,
-                                                  is_grad_enabled)
-
+        
+        if fp8:
+            ln_out = tex.cast_to_fp8(
+                inputmat,
+                fp8_meta["scaling_fwd"],
+                tex.FP8FwdTensors.GEMM1_INPUT,
+                fp8_dtype_forward,
+            )
+        else:
+            ln_out = cast_if_needed(inputmat, activation_dtype)
+        
         # Column Parallel Linear
-        ln_out_gathered = False
         if ub_overlap_ag:
             ln_out_total = ub_obj_lnout.get_ubuf_output(1)
             ln_out = torch.empty_like(ln_out)
-            if ub_obj_lnout.is_atomic_gemm():
-                ub_algo_ag = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG_P2P
-            else:
-                ub_algo_ag = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
         elif set_parallel_mode and sequence_parallel:
-            ln_out_gathered = True
             ln_out_total, _ = gather_along_first_dim(ln_out, tp_group)
         else:
             ln_out_total = ln_out
-
-        # If residual connection is after LN, we need `ln_out`
-        # tensor in higher precision, this comes at the cost
-        # of an extra fp8 cast.
-        if return_layernorm_output:
-            ln_out_return = ln_out_total if return_layernorm_output_gathered else ln_out
-            if fp8:
-                if ub_overlap_ag:
-                    ln_out = tex.cast_to_fp8(
-                        ln_out,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_INPUT,
-                        fp8_dtype_forward,
-                    )
-                else:
-                    ln_out_total = tex.cast_to_fp8(
-                        ln_out_total,
-                        fp8_meta["scaling_fwd"],
-                        tex.FP8FwdTensors.GEMM1_INPUT,
-                        fp8_dtype_forward,
-                    )
-                    if ln_out_gathered:
-                        rank = torch.distributed.get_rank(tp_group)
-                        slice_start = rank * ln_out.size(0)
-                        slice_end = (rank + 1) * ln_out.size(0)
-                        ln_out = ln_out_total[slice_start:slice_end, ...]
-                    else:
-                        ln_out = ln_out_total
+        assert not (set_parallel_mode and sequence_parallel), 'not tested yet'
 
         if fp8:
             bias_dtype = (
@@ -276,8 +281,9 @@ class _LayerNormMLP(torch.autograd.Function):
                     )
                     fc2_weight_t_fp8 = None
 
-            # Perform FP8 GEMM
-            fp8_gemm_args = [
+            ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ub_split_ag else None
+            ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG if ub_atomic_gemm_ag else ub_algo
+            fc1_out, _ = tex.fp8_gemm(
                 fc1_weight_fp8._data,
                 fp8_meta["scaling_fwd"].scale_inv,
                 tex.FP8FwdTensors.GEMM1_WEIGHT,
@@ -288,62 +294,35 @@ class _LayerNormMLP(torch.autograd.Function):
                 fp8_dtype_forward,
                 activation_dtype,
                 get_workspace(),
-            ]
-            fp8_gemm_kwargs = dict(
                 bias=fc1_bias,
                 use_bias=use_fc1_bias,
                 use_split_accumulator=_2X_ACC_FPROP,
-                ub_algo=ub_algo_ag if ub_overlap_ag else None,
+                ub_algo=ub_algo,
                 ub=ub_obj_lnout if ub_overlap_ag else None,
                 extra_output_tensor=ln_out if ub_overlap_ag else None,
             )
-            if gemm_gelu_fusion:
-                fp8_gemm_args[8] = torch.uint8  # out_dtype
-                fp8_gemm_kwargs.update(
-                    dict(
-                        gelu=True,
-                        out_index=tex.FP8FwdTensors.GEMM2_INPUT,
-                        fp8_meta_tensor=fp8_meta["scaling_fwd"],
-                        D_dtype=fp8_dtype_forward,
-                    )
-                )
-            fp8_gemm_out = tex.fp8_gemm(*fp8_gemm_args, **fp8_gemm_kwargs)
+            
             if not is_grad_enabled:
                 clear_tensor_data(ln_out_total)
 
-            # Perform activation
-            if gemm_gelu_fusion:
-                gelu_out, fc1_out = fp8_gemm_out
-            else:
-                fc1_out, _ = fp8_gemm_out
-                gelu_out = activation_func(
-                    fc1_out,
-                    fp8_meta["scaling_fwd"],
-                    tex.FP8FwdTensors.GEMM2_INPUT,
-                    fp8_dtype_forward,
-                )
+            gelu_out = activation_func(
+                fc1_out,
+                fp8_meta["scaling_fwd"],
+                tex.FP8FwdTensors.GEMM2_INPUT,
+                fp8_dtype_forward,
+            )
             if not is_grad_enabled:
                 clear_tensor_data(fc1_out)
 
             fc2_out_index, fc2_meta_tensor, fc2_te_type, out_type = (
                 None, None, None, activation_dtype)
-            if ub_overlap_rs:
+            if ub_split_rs or ub_atomic_gemm_rs:
                 ub_obj_fc2out = get_ub("fc2_fprop")
                 fc2_out = ub_obj_fc2out.get_ubuf_output(1)
                 dim_size = list(gelu_out.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = fc2_weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
-                if ub_obj_fc2out.is_p2p_overlap():
-                    if ub_obj_fc2out.is_atomic_gemm():
-                        ub_algo_rs = tex.UbufOverlapAlgo.ATOMIC_GEMM_RS_P2P
-                    else:
-                        ub_algo_rs = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS_P2P
-                else:
-                    if ub_obj_fc2out.is_atomic_gemm():
-                        ub_algo_rs = tex.UbufOverlapAlgo.ATOMIC_GEMM_RS
-                    else:
-                        ub_algo_rs = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS
 
                 if ub_obj_fc2out.is_fp8_ubuf():
                     fc2_out_index = tex.FP8FwdTensors.GEMM2_OUTPUT
@@ -356,6 +335,8 @@ class _LayerNormMLP(torch.autograd.Function):
                 dim_size[1] = fc2_weight.size(0)
                 fc2_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
 
+            ub_algo=tex.UbufOverlapAlgo.ATOMIC_GEMM_RS if ub_atomic_gemm_rs else None
+            ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS if ub_split_rs else ub_algo
             _ = tex.fp8_gemm(
                 fc2_weight_fp8._data,
                 fp8_meta["scaling_fwd"].scale_inv,
@@ -371,9 +352,9 @@ class _LayerNormMLP(torch.autograd.Function):
                 use_bias=use_fc2_bias,
                 use_split_accumulator=_2X_ACC_FPROP,
                 out=fc2_out,
-                ub_algo=ub_algo_rs if ub_overlap_rs else None,
-                ub=ub_obj_fc2out if ub_overlap_rs else None,
-                extra_output_tensor=rs_out if ub_overlap_rs else None,
+                ub_algo=ub_algo,
+                ub=ub_obj_fc2out if ub_split_rs or ub_atomic_gemm_rs else None,
+                extra_output_tensor=rs_out if ub_split_rs or ub_atomic_gemm_rs else None,
                 out_index=fc2_out_index,
                 fp8_meta_tensor = fc2_meta_tensor,
                 D_dtype = fc2_te_type,
@@ -409,9 +390,9 @@ class _LayerNormMLP(torch.autograd.Function):
                 bias=fc1_bias,
                 use_bias=(not bias_gelu_nvfusion) and use_fc1_bias,
                 gelu=not bias_gelu_nvfusion and (activation == 'gelu'),
-                ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P if ub_overlap_ag else None,
-                ub=ub_obj_lnout if ub_overlap_ag else None,
-                extra_output_tensor=ln_out if ub_overlap_ag else None,
+                ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ub_split_ag else None,
+                ub=ub_obj_lnout if ub_split_ag else None,
+                extra_output_tensor=ln_out if ub_split_ag else None,
             )
             if not is_grad_enabled:
                 clear_tensor_data(ln_out_total)
@@ -441,17 +422,13 @@ class _LayerNormMLP(torch.autograd.Function):
                 fp8_meta["scaling_fwd"].amax_history[0][tex.FP8FwdTensors.GEMM2_WEIGHT] = \
                     torch.max(-amin, amax).float()
 
-            if ub_overlap_rs:
+            if ub_split_rs:
                 ub_obj_fc2out = get_ub("fc2_fprop")
                 fc2_out = ub_obj_fc2out.get_ubuf_output(1)
                 dim_size = list(gelu_out.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = fc2_weight.size(0)
                 rs_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
-                if ub_obj_fc2out.is_p2p_overlap():
-                    ub_algo_rs = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS_P2P
-                else:
-                    ub_algo_rs = tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS
             else:
                 dim_size = list(gelu_out.size())
                 dim_size[1] = fc2_weight.size(0)
@@ -464,9 +441,9 @@ class _LayerNormMLP(torch.autograd.Function):
                 bias=fc2_bias,
                 use_bias=use_fc2_bias,
                 out=fc2_out,
-                ub_algo=ub_algo_rs if ub_overlap_rs else None,
-                ub=ub_obj_fc2out if ub_overlap_rs else None,
-                extra_output_tensor=rs_out if ub_overlap_rs else None,
+                ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_RS if ub_split_rs else None,
+                ub=ub_obj_fc2out if ub_split_rs else None,
+                extra_output_tensor=rs_out if ub_split_rs else None,
             )
             if not is_grad_enabled:
                 clear_tensor_data(gelu_out)
@@ -480,24 +457,24 @@ class _LayerNormMLP(torch.autograd.Function):
                     fc1_weight_t_fp8.weight_offloading = True
                 if fp8 and fc2_weight_t_fp8 is not None:
                     fc2_weight_t_fp8.weight_offloading = True
-                ln_weight.weight_offloading = True
+                # ln_weight.weight_offloading = True
                 fc1_weight.weight_offloading = True
                 fc2_weight.weight_offloading = True
                 fc1_bias.weight_offloading = True
 
                 inputmat.activation_offloading = True
-                if normalization == "LayerNorm":
-                    mu.activation_offloading = True
-                rsigma.activation_offloading = True
+                # if normalization == "LayerNorm":
+                #     mu.activation_offloading = True
+                # rsigma.activation_offloading = True
                 ln_out.activation_offloading = True
                 fc1_out.activation_offloading = True
                 gelu_out.activation_offloading = True
 
             ctx.save_for_backward(
-                inputmat,
-                ln_weight,
-                mu,
-                rsigma,
+                # inputmat,
+                # ln_weight,
+                # mu,
+                # rsigma,
                 ln_out,
                 fc1_out,
                 gelu_out,
@@ -525,20 +502,19 @@ class _LayerNormMLP(torch.autograd.Function):
             ctx.tp_group = tp_group
             ctx.tp_size = tp_size
             ctx.bias_gelu_nvfusion = bias_gelu_nvfusion
-            ctx.return_layernorm_output = return_layernorm_output
-            ctx.return_layernorm_output_gathered = return_layernorm_output_gathered \
-                                                   and ln_out_gathered
+            # ctx.return_layernorm_output = return_layernorm_output
             ctx.set_parallel_mode = set_parallel_mode
-            ctx.bwd_ln_sm_margin = bwd_ln_sm_margin
+            # ctx.bwd_ln_sm_margin = bwd_ln_sm_margin
             ctx.zero_centered_gamma = zero_centered_gamma
             ctx.ub_bulk_wgrad = ub_bulk_wgrad
             ctx.ub_bulk_dgrad = ub_bulk_dgrad
-            ctx.ub_overlap_ag = ub_overlap_ag
+            ctx.ub_split_ag = ub_split_ag
+            ctx.ub_atomic_gemm_ag = ub_atomic_gemm_ag
             ctx.requires_dgrad = inp.requires_grad
-            ctx.normalization = normalization
+            # ctx.normalization = normalization
 
         # Row Parallel Linear
-        if ub_overlap_rs:
+        if ub_split_rs or ub_atomic_gemm_rs:
             fc2_out = rs_out
         elif set_parallel_mode and sequence_parallel:
             fc2_out, _ = reduce_scatter_along_first_dim(fc2_out, tp_group)
@@ -548,12 +524,8 @@ class _LayerNormMLP(torch.autograd.Function):
         # [*, in_features] -> [*, out_features] except first dimension changes for SP
         fc2_out = fc2_out.view(-1, *inp.shape[1:-1], fc2_out.shape[-1])
 
-        if return_layernorm_output:
-            if return_layernorm_output_gathered:
-                shape = list(inp.shape)
-                shape[0] *= tp_size
-                return fc2_out, ln_out_return.view(shape)
-            return fc2_out, ln_out_return.view_as(inp)
+        # if return_layernorm_output:
+        #     return fc2_out, ln_out_return.view_as(inp)
         return fc2_out
 
 
@@ -562,13 +534,9 @@ class _LayerNormMLP(torch.autograd.Function):
         ctx, *grad_outputs: Tuple[torch.Tensor, ...]
     ) -> Tuple[Union[torch.Tensor, None], ...]:
         with _prepare_backward(
-            ctx.fp8, ctx.fp8_meta, ctx.tp_group, ctx.tp_size, name="_LayerNormMLP"
+            ctx.fp8, ctx.fp8_meta, ctx.tp_group, ctx.tp_size, name="_MLP"
         ):
             (
-                inputmat,
-                ln_weight,
-                mu,
-                rsigma,
                 ln_out,
                 fc1_out,
                 gelu_out,
@@ -581,7 +549,8 @@ class _LayerNormMLP(torch.autograd.Function):
                 fc1_bias,
                 fwd_scale_inverses,
             ) = ctx.saved_tensors
-
+            inputmat_shape = ln_out.shape
+            
             if ctx.cpu_offloading and ctx.fuse_wgrad_accumulation:
                 fc1_weight = Parameter(fc1_weight, False)
                 fc2_weight = Parameter(fc2_weight, False)
@@ -590,11 +559,10 @@ class _LayerNormMLP(torch.autograd.Function):
                 fc2_weight.main_grad = fc2_weight_main_grad
 
             # Primary weights are in FP8.
-            update_transpose_cache = "reuse_only" if ctx.is_first_microbatch is None else "lazy"
             if ctx.fp8 and fc1_weight_t_fp8 is None:
-                fc1_weight_t_fp8 = fc1_weight.transpose(update_cache=update_transpose_cache)
+                fc1_weight_t_fp8 = fc1_weight.transpose(update_cache=ctx.is_first_microbatch)
             if ctx.fp8 and fc2_weight_t_fp8 is None:
-                fc2_weight_t_fp8 = fc2_weight.transpose(update_cache=update_transpose_cache)
+                fc2_weight_t_fp8 = fc2_weight.transpose(update_cache=ctx.is_first_microbatch)
 
             activation_func = _act_func(ctx.activation)[1]
 
@@ -607,19 +575,18 @@ class _LayerNormMLP(torch.autograd.Function):
                 dim_size[0] = dim_size[0] * tp_world_size
                 ub_obj_lnout = get_ub("fc1_dgrad")
                 ub_obj_lnout.copy_input_to_ubuf(ln_out, 1)
-            if ctx.ub_overlap_ag:
+            ub_overlap_ag = ctx.ub_split_ag or ctx.ub_atomic_gemm_ag
+            if ub_overlap_ag:
                 tp_world_size = get_distributed_world_size(ctx.tp_group)
                 if tp_world_size == 1:
+                    ctx.ub_split_ag = False
                     ctx.ub_overlap_ag = False
+            ub_overlap_ag = ctx.ub_split_ag or ctx.ub_atomic_gemm_ag
 
-            if ctx.ub_overlap_ag:
+            if ub_overlap_ag:
                 dim_size = list(grad_outputs[0].size())
                 dim_size[0] = dim_size[0] * tp_world_size
                 ctx.ub_obj_gradout = get_ub("fc2_dgrad")
-                if ctx.ub_obj_gradout.is_atomic_gemm():
-                    ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG_P2P
-                else:
-                    ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P
 
             ctx.use_bias = ctx.use_fc2_bias # For grad_output_preprocess
             (
@@ -633,7 +600,7 @@ class _LayerNormMLP(torch.autograd.Function):
 
             if ctx.ub_bulk_wgrad:
                 tp_world_size = get_distributed_world_size(ctx.tp_group)
-                if tp_world_size == 1 or not fc1_weight.requires_grad:
+                if tp_world_size == 1:
                     ctx.ub_bulk_wgrad = False
             # Column Parallel Linear
             # Overlap input AG with dgrad
@@ -663,6 +630,8 @@ class _LayerNormMLP(torch.autograd.Function):
                     ctx.fp8_meta["recipe"], fprop_tensor=False
                 )
 
+                ub_algo = tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ctx.ub_split_ag else None
+                ub_algo = tex.UbufOverlapAlgo.ATOMIC_GEMM_AG if ctx.ub_atomic_gemm_ag else ub_algo
                 # FC2 DGRAD; Unconditional
                 fc2_dgrad, _ = tex.fp8_gemm(
                     fc2_weight_t_fp8._data,
@@ -676,10 +645,10 @@ class _LayerNormMLP(torch.autograd.Function):
                     ctx.activation_dtype,
                     get_workspace(),
                     use_split_accumulator=_2X_ACC_DGRAD,
-                    ub_algo=ub_algo if ctx.ub_overlap_ag else None,
-                    ub=ctx.ub_obj_gradout if ctx.ub_overlap_ag else None,
+                    ub_algo=ub_algo,
+                    ub=ctx.ub_obj_gradout if ub_overlap_ag else None,
                 )
-                if ctx.ub_overlap_ag:
+                if ub_overlap_ag:
                     grad_output_t = tex.fp8_transpose(grad_output_c, fp8_dtype_backward)
                 clear_tensor_data(grad_output_c)
 
@@ -727,9 +696,9 @@ class _LayerNormMLP(torch.autograd.Function):
                     clear_tensor_data(fc1_out)
                 else:
                     if fc2_weight.requires_grad:
-                        gelu_out_c = torch.ops.tex_ts.cast_from_fp8_ts(
+                        gelu_out_c = tex.cast_from_fp8(
                             gelu_out,
-                            fwd_scale_inverses,
+                            ctx.fp8_meta["scaling_fwd"],
                             tex.FP8FwdTensors.GEMM2_INPUT,
                             fp8_dtype_forward,
                             TE_DType[ctx.activation_dtype],
@@ -817,9 +786,8 @@ class _LayerNormMLP(torch.autograd.Function):
                     gelu=(not ctx.bias_gelu_nvfusion) and (ctx.activation == 'gelu'),
                     grad=True,
                     gelu_input=fc1_out,
-                    ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG_P2P \
-                        if ctx.ub_overlap_ag else None,
-                    ub=ctx.ub_obj_gradout if ctx.ub_overlap_ag else None,
+                    ub_algo=tex.UbufOverlapAlgo.SPLIT_PIPELINED_AG if ctx.ub_split_ag else None,
+                    ub=ctx.ub_obj_gradout if ctx.ub_split_ag else None,
                 )
 
                 # FC2 WGRAD
@@ -884,8 +852,6 @@ class _LayerNormMLP(torch.autograd.Function):
                 if not ctx.ub_bulk_dgrad and handle is not None:
                     handle.wait()
                 if not ctx.ub_bulk_wgrad:
-                    if ctx.return_layernorm_output and ctx.return_layernorm_output_gathered:
-                        fc1_dgrad = fc1_dgrad + grad_outputs[1].view_as(fc1_dgrad)
                     fc1_dgrad, handle = reduce_scatter_along_first_dim(
                         fc1_dgrad, ctx.tp_group, async_op=True
                     )
@@ -929,9 +895,9 @@ class _LayerNormMLP(torch.autograd.Function):
                         )
                         clear_tensor_data(ln_out_total_t, dgelu_t)
                     else:
-                        ln_out_total_c = torch.ops.tex_ts.cast_from_fp8_ts(
+                        ln_out_total_c = tex.cast_from_fp8(
                             ln_out_total,
-                            fwd_scale_inverses,
+                            ctx.fp8_meta["scaling_fwd"],
                             tex.FP8FwdTensors.GEMM1_INPUT,
                             fp8_dtype_forward,
                             TE_DType[ctx.activation_dtype],
@@ -985,23 +951,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 handle.wait()
 
             # LayerNorm gradient
-            dgrad = fc1_dgrad.view(inputmat.shape)
-
-            # Residual gradient
-            if ctx.return_layernorm_output and not ctx.return_layernorm_output_gathered:
-                dgrad = dgrad + grad_outputs[1].view_as(dgrad)
-
-            if ctx.normalization == "LayerNorm":
-                dgrad, dgamma, dbeta = tex.layernorm_bwd(
-                    dgrad, inputmat, mu, rsigma, ln_weight,
-                    ctx.bwd_ln_sm_margin, ctx.zero_centered_gamma
-                )
-            elif ctx.normalization == "RMSNorm":
-                dgrad, dgamma = tex.rmsnorm_bwd(
-                    dgrad, inputmat, rsigma, ln_weight,
-                    ctx.bwd_ln_sm_margin, ctx.zero_centered_gamma
-                )
-                dbeta = None
+            dgrad = fc1_dgrad.view(inputmat_shape)
 
         if fc1_weight.requires_grad:
             # Handle custom DDP from mcore.
@@ -1047,8 +997,6 @@ class _LayerNormMLP(torch.autograd.Function):
 
         return (
             dgrad.view(ctx.inp_shape) if ctx.requires_dgrad else None,
-            dgamma,
-            dbeta,
             fc1_wgrad,
             None,
             None,
@@ -1082,15 +1030,10 @@ class _LayerNormMLP(torch.autograd.Function):
             None,
             None,
             None,
-            None,
-            None,
-            None,
-            None,
-            None,
         )
 
 
-class LayerNormMLP(TransformerEngineBaseModule):
+class MLP(TransformerEngineBaseModule):
     r"""
     Applies layer normalization on the input followed by the MLP module, consisting of
     2 successive linear transformations, separated by the GeLU activation.
@@ -1109,7 +1052,7 @@ class LayerNormMLP(TransformerEngineBaseModule):
                    type of normalization applied.
     activation : str, default = 'gelu'
           activation function used.
-          Options: 'gelu', 'geglu', 'relu', 'reglu', 'squared_relu', 'swiglu', 'qgelu'.
+          Options: 'gelu', 'geglu', 'relu', 'reglu', 'squared_relu', 'swiglu'.
     init_method : Callable, default = `None`
                  used for initializing FC1 weights in the following way: `init_method(weight)`.
                  When set to `None`, defaults to `torch.nn.init.normal_(mean=0.0, std=0.023)`.
@@ -1122,12 +1065,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
                              together with the output of the linear transformation.
                              Example use case: residual connection for transformer module
                              is taken post layernorm.
-    return_layernorm_output_gathered : bool, default = `False`
-                             if set to `True`, output of layernorm is returned after the all
-                             gather operation. Ignored if return_layernorm_output is False.
-                             Example use case: with sequence parallel, input to residual connection
-                             for transformer module (e.g. LoRA) will need to be gathered.
-                             Returning layernorm output gathered will prevent a redundant gather.
     zero_centered_gamma : bool, default = 'False'
                          if set to 'True', gamma parameter in LayerNorm is initialized to 0 and
                          the LayerNorm formula changes to
@@ -1187,21 +1124,21 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self,
         hidden_size: int,
         ffn_hidden_size: int,
-        eps: float = 1e-5,
+        # eps: float = 1e-5,
         sequence_parallel: bool = False,
         return_bias: bool = False,
         get_rng_state_tracker: Optional[Callable] = None,
+        rng_tracker_name: Optional[str] = None,
         tp_group: Optional[dist_group_type] = None,
         tp_size: int = 1,
         init_method: Optional[Callable] = None,
         bias: bool = True,
-        normalization: str = 'LayerNorm',
+        # normalization: str = 'LayerNorm',
         activation : str = "gelu",
         output_layer_init_method: Optional[Callable] = None,
         fuse_wgrad_accumulation: bool = False,
         params_dtype: Optional[torch.dtype] = None,
-        return_layernorm_output: bool = False,
-        return_layernorm_output_gathered: bool = False,
+        # return_layernorm_output: bool = False,
         seq_length: Optional[int] = None,
         micro_batch_size: Optional[int] = None,
         set_parallel_mode: bool = False,
@@ -1209,23 +1146,24 @@ class LayerNormMLP(TransformerEngineBaseModule):
         device: Union[torch.device, str] = "cuda",
         ub_bulk_wgrad: bool = False,
         ub_bulk_dgrad: bool = False,
-        ub_overlap_rs: bool = False,
-        ub_overlap_ag: bool = False,
+        ub_split_rs: bool = False,
+        ub_atomic_gemm_rs: bool = False,
+        ub_split_ag: bool = False,
+        ub_atomic_gemm_ag: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
-        
+
         params_dtype = torch.get_default_dtype() if params_dtype is None else params_dtype
         self.fuse_wgrad_accumulation = fuse_wgrad_accumulation
-        self.normalization = normalization
-        assert normalization in ['LayerNorm', 'RMSNorm'], "Unsupported normalization type!"
+        # self.normalization = normalization
+        # assert normalization in ['LayerNorm', 'RMSNorm'], "Unsupported normalization type!"
         self.use_bias = bias
         self.activation = activation
         self.return_bias = return_bias
         self.apply_bias = bias and not return_bias
-        self.return_layernorm_output = return_layernorm_output
-        self.return_layernorm_output_gathered = return_layernorm_output_gathered
+        # self.return_layernorm_output = return_layernorm_output
         self.bias_gelu_nvfusion = (bool(int(os.getenv("NVTE_BIAS_GELU_NVFUSION", "1"))) and
                                    self.activation == 'gelu')
         self.set_parallel_mode = set_parallel_mode
@@ -1233,17 +1171,25 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self.primary_weights_in_fp8 = FP8GlobalStateManager.with_fp8_parameters()
         self.ub_bulk_wgrad = ub_bulk_wgrad
         self.ub_bulk_dgrad = ub_bulk_dgrad
-        self.ub_overlap_rs = ub_overlap_rs
-        self.ub_overlap_ag = ub_overlap_ag
-        # GEMM-GELU fusion is currently only supported with split GEMM-AG overlap
-        self.gemm_gelu_fusion = \
-            (bool(int(os.getenv("NVTE_GEMM_GELU_FUSION", "0"))) and
-            self.activation == 'gelu' and not get_ub("fc1_fprop").is_atomic_gemm())
+        self.ub_split_rs = ub_split_rs
+        self.ub_split_ag = ub_split_ag
+        self.ub_atomic_gemm_rs = ub_atomic_gemm_rs
+        self.ub_atomic_gemm_ag = ub_atomic_gemm_ag
 
-        if any([ub_bulk_wgrad, ub_bulk_dgrad, ub_overlap_rs, ub_overlap_ag]):
+        if (ub_bulk_wgrad # pylint: disable=too-many-boolean-expressions
+            or ub_bulk_dgrad
+            or ub_split_rs
+            or ub_split_ag
+            or ub_atomic_gemm_rs
+            or ub_atomic_gemm_ag):
             assert (
                 tex.userbuf_comm_available()
             ), "Userbuffer communication backend not available."
+
+        if ub_atomic_gemm_rs or ub_atomic_gemm_ag:
+            warnings.warn(
+                "Atomic gemm uses a beta API from cublas and is not tested for all use cases."
+            )
 
         if tp_group is None:
             self.tp_size = tp_size
@@ -1261,22 +1207,23 @@ class LayerNormMLP(TransformerEngineBaseModule):
 
         self.sequence_parallel = (self.tp_size > 1) and sequence_parallel
         self.size_per_partition = divide(ffn_hidden_size, self.tp_size)
-
-        # LN init
-        self.eps = eps
-        layer_norm_weight = Parameter(
-            torch.empty(hidden_size, device=device, dtype=params_dtype)
-        )
-        self.register_parameter('layer_norm_weight', layer_norm_weight,
-                                init_fn=init_method_constant(float(not self.zero_centered_gamma)))
-        if self.normalization != "RMSNorm":
-            layer_norm_bias = Parameter(
-                torch.empty(hidden_size, device=device, dtype=params_dtype)
-            )
-            self.register_parameter('layer_norm_bias', layer_norm_bias,
-                                    init_fn=init_method_constant(0.0))
-        else:
-            self.layer_norm_bias = None
+        self.rng_tracker_name = rng_tracker_name
+        
+        # # LN init
+        # self.eps = eps
+        # layer_norm_weight = Parameter(
+        #     torch.empty(hidden_size, device=device, dtype=params_dtype)
+        # )
+        # self.register_parameter('layer_norm_weight', layer_norm_weight,
+        #                         init_fn=init_method_constant(float(not self.zero_centered_gamma)))
+        # if self.normalization != "RMSNorm":
+        #     layer_norm_bias = Parameter(
+        #         torch.empty(hidden_size, device=device, dtype=params_dtype)
+        #     )
+        #     self.register_parameter('layer_norm_bias', layer_norm_bias,
+        #                             init_fn=init_method_constant(0.0))
+        # else:
+        #     self.layer_norm_bias = None
 
         # FC1 init
         if self.activation in ['reglu', 'geglu', 'swiglu']:
@@ -1350,38 +1297,37 @@ class LayerNormMLP(TransformerEngineBaseModule):
         self.fwd_ln_sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
         self.bwd_ln_sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
 
+    # def reset_layer_norm_parameters(self) -> None:
+    #     """Init LN params"""
+    #     warnings.warn(
+    #         ("This method will be deprecated in an upcoming release. "
+    #          "Update your code to use LayerNormMLP.reset_parameters() instead."),
+    #         DeprecationWarning,
+    #         stacklevel=2
+    #     )
+    #     if not self.zero_centered_gamma:
+    #         init.ones_(self.layer_norm_weight)
+    #     else:
+    #         init.zeros_(self.layer_norm_weight)
+    #     if self.layer_norm_bias is not None:
+    #         init.zeros_(self.layer_norm_bias)
+
     def extra_repr(self):
         return (
             f'hidden_size={self.hidden_size}, '
-            f'ffn_hidden_size={self.size_per_partition}, '
+            f'ffn_hidden_size={self.ffn_hidden_size}, '
             f'activation={self.activation}, '
-            f'normalization={self.normalization}, '
             f'primary_weights_in_fp8={self.primary_weights_in_fp8}'
         )
-    
-    def reset_layer_norm_parameters(self) -> None:
-        """Init LN params"""
-        warnings.warn(
-            ("This method will be deprecated in an upcoming release. "
-             "Update your code to use LayerNormMLP.reset_parameters() instead."),
-            DeprecationWarning,
-            stacklevel=2
-        )
-        if not self.zero_centered_gamma:
-            init.ones_(self.layer_norm_weight)
-        else:
-            init.zeros_(self.layer_norm_weight)
-        if self.layer_norm_bias is not None:
-            init.zeros_(self.layer_norm_bias)
-
+                
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)
 
         if not defer_init:
             # Set parallel attributes for layer norm parameters
-            setattr(self.layer_norm_weight, "sequence_parallel", self.sequence_parallel)
-            if self.normalization != "RMSNorm":
-                setattr(self.layer_norm_bias, "sequence_parallel", self.sequence_parallel)
+            # setattr(self.layer_norm_weight, "sequence_parallel", self.sequence_parallel)
+            # if self.normalization != "RMSNorm":
+            #     setattr(self.layer_norm_bias, "sequence_parallel", self.sequence_parallel)
 
             # Set parallel attributes for linear parameters
             set_tensor_model_parallel_attributes(self.fc1_weight, True, 0, 1)
@@ -1441,7 +1387,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
                                first microbatch (since it is the first gradient being
                                produced)
         """
-
         with self.prepare_forward(inp, is_first_microbatch, num_gemms=2) as inp:
             assert self.fp8 or not self.primary_weights_in_fp8, \
                    "Need to run inside fp8_autocast region when weights are stored in FP8."
@@ -1450,24 +1395,37 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 self.get_fp8_weights_scratchpad(
                         is_first_microbatch
                 )
-
-            # Disable bias_gelu_nvfusion for determinism checkpointing in non-reentrant mode
-            if (self.bias_gelu_nvfusion
-                and not use_reentrant_activation_recompute()):
-                self.bias_gelu_nvfusion = False
-
+            if inp.nelement() == 0:
+                if torch.is_grad_enabled():
+                    fwd_fn = _EmptyMLP.apply
+                    args = []
+                else:
+                    fwd_fn = _EmptyMLP.forward
+                    args = [None]
+                args += (
+                    inp,
+                    self.fc1_weight,
+                    self.fc1_bias,
+                    self.fc2_weight,
+                    self.fc2_bias,
+                    self.fp8,
+                    self.fp8_meta,
+                    self.tp_group,
+                    self.tp_size,
+                    torch.is_grad_enabled(),
+                )
+                return fwd_fn(*args)
+            
             from ..cpu_offload import CPUOffloadEnabled
 
             if torch.is_grad_enabled():
-                fwd_fn = _LayerNormMLP.apply
+                fwd_fn = _MLP.apply
                 args = []
             else:
-                fwd_fn = _LayerNormMLP.forward
+                fwd_fn = _MLP.forward
                 args = [None]
             args += (
                 inp,
-                self.layer_norm_weight,
-                self.layer_norm_bias,
                 self.fc1_weight,
                 weight1_fp8,
                 weight1_t_fp8,
@@ -1478,7 +1436,6 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 weight2_t_fp8,
                 self.fc2_bias,
                 self.apply_bias and not self.gemm_bias_unfused_add,
-                self.eps,
                 is_first_microbatch,
                 self.fp8,
                 self.fp8_calibration,
@@ -1490,35 +1447,25 @@ class LayerNormMLP(TransformerEngineBaseModule):
                 self.sequence_parallel,
                 self.tp_size > 1,
                 self.activation_dtype,
-                self.return_layernorm_output,
-                self.return_layernorm_output_gathered,
                 self.bias_gelu_nvfusion,
                 self.set_parallel_mode,
                 torch.is_grad_enabled(),
-                self.fwd_ln_sm_margin,
-                self.bwd_ln_sm_margin,
                 self.zero_centered_gamma,
                 self.activation,
-                self.normalization,
                 self.primary_weights_in_fp8,
                 self.ub_bulk_wgrad,
                 self.ub_bulk_dgrad,
-                self.ub_overlap_rs,
-                self.ub_overlap_ag,
-                self.gemm_gelu_fusion,
+                self.ub_split_rs,
+                self.ub_atomic_gemm_rs,
+                self.ub_split_ag,
+                self.ub_atomic_gemm_ag,
             )
             out = fwd_fn(*args)
 
-        if self.return_layernorm_output:
-            out, ln_out = out
 
         if self.gemm_bias_unfused_add:
             out = out + cast_if_needed(self.fc2_bias, self.activation_dtype)
 
         if self.return_bias:
-            if self.return_layernorm_output:
-                return out, cast_if_needed(self.fc2_bias, self.activation_dtype), ln_out
             return out, cast_if_needed(self.fc2_bias, self.activation_dtype)
-        if self.return_layernorm_output:
-            return out, ln_out
         return out

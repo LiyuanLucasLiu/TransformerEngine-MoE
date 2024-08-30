@@ -124,6 +124,7 @@ class LayerNorm(torch.nn.Module):
         params_dtype = torch.get_default_dtype() if params_dtype is None else params_dtype
         self.eps = eps
         self.zero_centered_gamma = zero_centered_gamma
+        self.hidden_size = hidden_size
         self.weight = Parameter(
             torch.empty(
                 hidden_size,
@@ -149,6 +150,12 @@ class LayerNorm(torch.nn.Module):
         self.fwd_ln_sm_margin = int(os.getenv("NVTE_FWD_LAYERNORM_SM_MARGIN", "0"))
         self.bwd_ln_sm_margin = int(os.getenv("NVTE_BWD_LAYERNORM_SM_MARGIN", "0"))
 
+    def extra_repr(self):
+        return (
+            f'({self.hidden_size},), eps={self.eps}, '
+            'elementwise_affine=True'
+        )
+    
     def reset_layer_norm_parameters(self) -> None:
         """Init LN params"""
         warnings.warn(

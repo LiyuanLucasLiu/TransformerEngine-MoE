@@ -50,6 +50,50 @@ from ..float8_tensor import Float8Tensor
 __all__ = ["Linear"]
 
 
+class _EmptyLinear(torch.autograd.Function):
+    """MLP semi-top level module
+    Calls custom cuda extensions.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        inp: torch.Tensor,
+        fc1_weight: torch.Tensor,
+        fc1_bias: torch.Tensor,
+        fp8: bool,
+        fp8_meta: Dict[str, Any],
+        tp_group: Union[dist_group_type, None],
+        tp_size: int,
+        is_grad_enabled: bool,
+    ):
+        if is_grad_enabled:
+            ctx.fp8 = fp8
+            ctx.fp8_meta = fp8_meta
+            ctx.tp_group = tp_group
+            ctx.tp_size = tp_size
+        return inp
+            
+
+    @staticmethod
+    def backward(
+        ctx, grad_outputs: torch.Tensor
+    ) -> Tuple[Union[torch.Tensor, None], ...]:
+        with _prepare_backward(
+            ctx.fp8, ctx.fp8_meta, ctx.tp_group, ctx.tp_size, name="_Linear"
+        ):
+            pass
+        return (
+            grad_outputs,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        
 class _Linear(torch.autograd.Function):
     """Linear semi-top level module
     Calls custom cuda extensions.
@@ -784,7 +828,14 @@ class Linear(TransformerEngineBaseModule):
             self.gemm_bias_unfused_add = True
         else:
             self.gemm_bias_unfused_add = False
-
+        
+    def extra_repr(self):
+        return (
+            f'in-feature={self.in_features}, '
+            f'out-feature={self.out_features}, '
+            f'primary_weights_in_fp8={self.primary_weights_in_fp8}'
+        )
+    
     def reset_parameters(self, defer_init=False):
         super().reset_parameters(defer_init=defer_init)
 
@@ -886,6 +937,25 @@ class Linear(TransformerEngineBaseModule):
             weight1_fp8, weight1_t_fp8 = self.get_fp8_weights_scratchpad(
                 is_first_microbatch
             )
+            
+            if inp.nelement() == 0:
+                if torch.is_grad_enabled():
+                    linear_fn = _EmptyLinear.apply
+                    args = []
+                else:
+                    linear_fn = _EmptyLinear.forward
+                    args = [None]
+                args += (
+                    inp,
+                    weight_tensor,
+                    bias_tensor,
+                    self.fp8,
+                    self.fp8_meta,
+                    self.tp_group,
+                    self.tp_size,
+                    torch.is_grad_enabled(),
+                )
+                return linear_fn(*args)
 
             from ..cpu_offload import CPUOffloadEnabled
 
